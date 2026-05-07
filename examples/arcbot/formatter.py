@@ -34,7 +34,7 @@ def format_perception(snap: dict, last_cmd: dict, last_outcome: str,
         "/imu/data",
         f"  accel m/s^2: {snap['imu']['linear_accel']}",
         f"  gyro  rad/s: {snap['imu']['angular_vel']}",
-        f"  mag_norm:    {snap['imu']['mag_norm']}",
+        f"  mag_uT:      {snap['imu']['mag_uT']}",
         "",
         "/joint_states",
         f"  left_ticks={snap['encoders']['left_ticks']}  "

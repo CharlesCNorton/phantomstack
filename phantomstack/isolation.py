@@ -73,9 +73,13 @@ def setup_isolated_home(target: Path) -> Path:
     """Populate `target` with the minimum needed to authenticate against
     the user's subscription. Skips CLAUDE.md, projects/, sessions/.
 
-    Idempotent: re-runs are safe and copy any newer auth files.
+    The auth and settings files live under `target/.claude/` so that
+    USERPROFILE=target lets the CLI find them at `~/.claude/`. Idempotent:
+    re-runs are safe and copy any newer auth files.
     """
     target.mkdir(parents=True, exist_ok=True)
+    claude_dir = target / ".claude"
+    claude_dir.mkdir(parents=True, exist_ok=True)
     src = real_claude_home()
     if not src.is_dir():
         raise FileNotFoundError(
@@ -85,7 +89,7 @@ def setup_isolated_home(target: Path) -> Path:
     for name in ALLOWED_AUTH_FILES:
         sf = src / name
         if sf.is_file():
-            shutil.copy2(sf, target / name)
+            shutil.copy2(sf, claude_dir / name)
     return target
 
 
