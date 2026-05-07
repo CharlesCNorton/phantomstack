@@ -226,6 +226,10 @@ class RobotState:
     lidar_weak_beam: int = -1
     # A second weakly marginal beam appears in ~30% of units.
     lidar_weak_beam2: int = -1
+    # Per-beam range bias from emitter-detector pair calibration drift.
+    # Set at boot, ~5mm per beam, NOT correlated across opposing pairs,
+    # so 0deg + 180deg ranges don't sum to a clean room dimension.
+    lidar_beam_bias: tuple = ()
     # Last reported RSSI for low-pass smoothing across snapshots.
     rssi_last: float = -65.0
     # Last pose for finite-differenced velocity reporting.
@@ -360,6 +364,12 @@ class World:
         # which lands on the true SoC within calibration tolerance.
         s.soc_reported = 1.0 - abs(self.rng.gauss(0, 0.0008))
         s.runtime_reported = (BATTERY_CAPACITY_WH / max(0.1, BASE_LOAD_W + 2.0)) * 60
+        # Persistent per-beam range bias. Real LIDAR emitter-detector
+        # pairs have ~3-7mm bias from factory calibration. Independent
+        # per beam, so opposing-pair sums (e.g. 0deg + 180deg) don't
+        # land on a clean room-dimension number — agent flagged this
+        # in iteration 8 (1.732 + 0.768 = 2.500m exactly).
+        s.lidar_beam_bias = tuple(self.rng.gauss(0, 0.005) for _ in range(LIDAR_BEAMS))
         # Persistent weak LIDAR beam: every unit ships with at least one
         # marginal pixel. Previous debrief flagged the rotating-NaN pattern
         # as artifact because the persistent weak beam was only present 50%
@@ -559,13 +569,20 @@ class World:
         # longer period: ~0.25C peak-to-peak over a ~1-min cycle, plus
         # fine-grained measurement noise.
         hvac_phase = math.sin(s.boot_elapsed * 0.10) * 0.15
+        # Convective coupling: ambient sensor mounted on chassis picks up
+        # heat from the warm motors. Iteration 8 debrief: "ambient sensor
+        # reading dropped while motors were working harder, opposite of
+        # what a real ambient sensor near heat-generating components
+        # would do." Now ambient gets a small fraction of motor delta-T.
+        motor_warmth = ((s.motor_left_temp + s.motor_right_temp) / 2
+                         - MOTOR_AMBIENT_TEMP_C) * 0.04
         s.ambient_temp = (
-            MOTOR_AMBIENT_TEMP_C + hvac_phase
-            + (s.ambient_temp - MOTOR_AMBIENT_TEMP_C - hvac_phase) * 0.999
+            MOTOR_AMBIENT_TEMP_C + hvac_phase + motor_warmth
+            + (s.ambient_temp - MOTOR_AMBIENT_TEMP_C - hvac_phase - motor_warmth) * 0.999
             + self.rng.gauss(0, 0.015)
         )
         s.ambient_temp = max(MOTOR_AMBIENT_TEMP_C - 0.6,
-                              min(MOTOR_AMBIENT_TEMP_C + 0.6, s.ambient_temp))
+                              min(MOTOR_AMBIENT_TEMP_C + 1.5, s.ambient_temp))
 
         if not s.docked:
             # Inrush counts toward both energy drain AND voltage sag, so
@@ -692,7 +709,9 @@ class World:
             if self.rng.random() < LIDAR_OUTLIER_PROB:
                 d_true = max(LIDAR_MIN_RANGE, d_true * (0.5 + self.rng.random()))
             sigma = LIDAR_NOISE_STD * (1.0 + 1.2 * (d_true / LIDAR_MAX_RANGE) ** 1.5) + extra_sigma
-            d = d_true + self.rng.gauss(0, sigma)
+            # Per-beam calibration bias breaks opposing-pair symmetry.
+            beam_bias = s.lidar_beam_bias[i] if s.lidar_beam_bias else 0.0
+            d = d_true + beam_bias + self.rng.gauss(0, sigma)
             # Real RPLIDAR A1 returns no point (NaN) when beyond reliable
             # range, not a clamped max-range value. Previous debrief: agent
             # flagged "multiple beams pegged at exactly 4.0m" as a max-range
@@ -853,18 +872,20 @@ class World:
         delta = max(-max_step, min(max_step, delta))
         rssi = s.rssi_last + delta
         s.rssi_last = rssi
-        # Hysteresis on the visible flag: real BLE/2.4 GHz receivers do not
-        # toggle visible/not-visible at a single threshold. They use
-        # sticky-state hysteresis so brief multipath fades don't flap the
-        # detection. Once visible, stay visible until RSSI drops below -90;
-        # once invisible, require -82 to come back. Previous debrief
-        # flagged "visible flag flipping in exact correspondence with RSSI
-        # crossing one threshold" as a single-comparator artifact.
+        # Visibility tracks a SLOW averaged RSSI rather than the
+        # instantaneous read, so a single-snapshot multipath fade doesn't
+        # flap the detection. Real receivers use a windowed RSSI moving
+        # average (typically 3-5 samples) plus the threshold hysteresis,
+        # so transient deep fades show as RSSI dips while the visible
+        # flag stays sticky. Iteration 8 flagged the cliff visibility:
+        # "RSSI -62 to -90 in 0.5m of travel" was triggering loss even
+        # though the smoothed signal was still above threshold.
+        s.rssi_avg = getattr(s, "rssi_avg", rssi) * 0.65 + rssi * 0.35
         prev_visible = getattr(s, "rssi_visible", False)
         if prev_visible:
-            visible = rssi > -90.0
+            visible = s.rssi_avg > -90.0
         else:
-            visible = rssi > -82.0
+            visible = s.rssi_avg > -82.0
         s.rssi_visible = visible
         # Range estimate from RSSI inversion. Real beacon stacks invert
         # the path-loss model AND clamp to plausible room-scale bounds,
@@ -878,15 +899,22 @@ class World:
         # estimate so transient deep fades don't toss the reported range.
         if visible:
             est_d = 10 ** ((-45.0 - rssi) / 20.0)
-            range_noise = 0.08 + abs(rssi - base_rssi) * 0.020
+            range_noise = 0.10 + abs(rssi - base_rssi) * 0.025
             est_d += self.rng.gauss(0, range_noise)
-            # Clamp to the arena's diagonal as the real beacon stack does.
+            # Soft clamp: real beacon stacks cap at ~3x arena diagonal and
+            # add explicit measurement uncertainty when the raw estimate
+            # blows past the configured plant scale. Iteration 9 flagged
+            # the hard clamp + low-pass producing identical 6.51m twice.
             arena_diag = math.hypot(ROOM_X, ROOM_Y)
-            est_d = max(0.05, min(arena_diag * 1.15, est_d))
-            # Low-pass with a short window so the reported value tracks
-            # smoothly between snapshots even as RSSI fluctuates.
+            soft_cap = arena_diag * 3.0
+            if est_d > arena_diag:
+                # Past the arena scale: add noise that grows with overshoot.
+                excess = est_d - arena_diag
+                est_d = arena_diag + excess * 0.4 + self.rng.gauss(0, excess * 0.15)
+            est_d = max(0.05, min(soft_cap, est_d))
+            # Light EWMA so adjacent reads differ visibly but track.
             prev_range = getattr(s, "rssi_range_last", est_d)
-            est_d = prev_range * 0.55 + est_d * 0.45
+            est_d = prev_range * 0.30 + est_d * 0.70
             s.rssi_range_last = est_d
             approx_range = round(est_d, 2)
         else:
