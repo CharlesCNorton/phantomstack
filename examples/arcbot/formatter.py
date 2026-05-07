@@ -37,8 +37,10 @@ def format_perception(snap: dict, last_cmd: dict, last_outcome: str,
         f"  mag_uT:      {snap['imu']['mag_uT']}",
         "",
         "/joint_states",
-        f"  left_ticks={snap['encoders']['left_ticks']}  "
-        f"right_ticks={snap['encoders']['right_ticks']}",
+        f"  left_ticks={snap['encoders']['left_ticks']} (d={snap['encoders']['left_ticks_delta']:+d})"
+        f"  right_ticks={snap['encoders']['right_ticks']} (d={snap['encoders']['right_ticks_delta']:+d})",
+        f"  left_wheel_vel={snap['encoders']['left_wheel_vel']}m/s  "
+        f"right_wheel_vel={snap['encoders']['right_wheel_vel']}m/s",
         "",
     ]
     bs = snap["battery"]

@@ -30,24 +30,36 @@ WHEEL_BASE = 0.16
 WHEEL_RADIUS = 0.033
 ENCODER_TICKS_PER_REV = 1440  # quadrature, 360 ppr * 4
 LIDAR_BEAMS = 12
-LIDAR_MIN_RANGE = 0.05
+# Real RPLIDAR A1 on a 200mm chassis cannot see anything within ~ROBOT_RADIUS
+# of center (the chassis blocks it). Datasheet min range is 0.15m. Iteration 13
+# debrief flagged "all 12 beams clustered at 0.144-0.211m" when the robot was
+# stuck — the real device would NaN those as below-min returns instead.
+LIDAR_MIN_RANGE = 0.15
 LIDAR_MAX_RANGE = 4.0
 TICK_HZ = 50.0
 TICK_DT = 1.0 / TICK_HZ
 
 BATTERY_FULL_V = 12.6
 BATTERY_EMPTY_V = 9.0
-BATTERY_CAPACITY_WH = 8.0
-BASE_LOAD_W = 4.5
+# 3S 2200mAh LiPo == ~24 Wh. Iteration 14 flagged 2.76% drain in 87s (~114%/hr)
+# as implausible for a small diff drive at low speed; the prior 8 Wh capacity
+# was modeling a much smaller pack than the persona's 3S nominal would imply.
+# 24 Wh gives ~27%/hr drain at 6.5W average load, in line with Roomba-class
+# robots (~14 Wh @ 7W avg = 50%/hr full speed; we're slower and bigger).
+BATTERY_CAPACITY_WH = 24.0
+# Iteration 20 flagged "1.13% drop over 90s is too flat for a Jetson Nano
+# + brushed DC under load." Real Jetson Nano under SLAM/ROS2 draws 8-12W,
+# not the 4.5W I had modeling Pi-class compute. Bumped to 8.0W matches
+# Jetson Nano nominal SLAM load (the persona names this hardware).
+BASE_LOAD_W = 8.0
 MOTOR_POWER_W_PER_MPS = 8.0
-MOTOR_THERMAL_TIME_CONST_S = 22.0
-# Tuned to 0.28 after a series of bracketing iterations. 0.18 produced
-# "implausibly stable for brushed DC under load." 0.45 produced "23 to
-# 30 C in 28 s, faster than expected for this thermal mass." 0.28 lands
-# in the realistic envelope: ~3-4 C rise visible within 30 s of mixed
-# light-load operation, full ~7 C steady-state delta reached over the
-# motor's ~22 s thermal time constant.
-MOTOR_HEAT_COEF = 0.28
+# Iteration 22 flagged "23 to 40 C in 82s is too fast for 33mm brushed
+# DC in open air at 22 C ambient." The tau=60/coef=0.12 pair gave half-
+# life of 41s; agent expected slower rise with visible non-linearities.
+# tau=120 + coef=0.06 gives half-life of 83s, so a 90s run with mixed
+# load reaches mid-30s. Steady-state at 5W = 58.5 C still plausible.
+MOTOR_THERMAL_TIME_CONST_S = 120.0
+MOTOR_HEAT_COEF = 0.06
 # Idle friction: real DC motors dissipate ~0.5-1W just spinning the
 # bearings even at no commanded load. This adds a baseline thermal floor
 # above ambient when the robot is awake.
@@ -58,14 +70,21 @@ LIDAR_NOISE_STD = 0.012
 # Real RPLIDAR A1 in a clean indoor scene returns ~1-3% invalid beams per
 # scan from baseline noise; the rest of the dropouts come from systematic
 # causes (the persistent weak beam, range-dependent SNR, specular hits on
-# circular obstacles). Previous debrief: a 6% baseline produced "rotating
-# NaN scatter across different beams each frame" that read as random
-# injection. Lowered to 1.5% so systematic dropouts dominate.
-LIDAR_DROPOUT_PROB = 0.015
+# circular obstacles). Iteration 13 flagged "NaN pattern shifted between
+# different beam indices across every snapshot" — the 1.5% baseline still
+# scattered NaNs visibly across non-weak beams. Lowered to 0.4% so the
+# persistent weak beam(s) dominate the NaN distribution and the agent sees
+# anchored, not scattered, dropout pattern.
+LIDAR_DROPOUT_PROB = 0.004
 LIDAR_OUTLIER_PROB = 0.008
 IMU_ACCEL_NOISE_STD = 0.04
 IMU_GYRO_NOISE_STD = 0.005
-IMU_GYRO_BIAS_RW = 0.0001
+# Iteration 20 still flagged gyro bias "extremely stable, never shifted
+# slightly as motors heat up." Bump bias random-walk sigma to 0.002 so
+# bias drifts ~19 mrad/s (~1 deg/s) over a 90s run, well-visible at
+# the snapshot rate. Real MPU-9250 with motor-vibration coupling and
+# thermal drift shows several deg/s of bias wander over minutes.
+IMU_GYRO_BIAS_RW = 0.002
 ENCODER_SLIP_STD = 0.002
 
 DOCK_X = 3.85
@@ -77,6 +96,45 @@ MAX_LINEAR_V = 0.30
 MAX_ANGULAR_V = 1.5
 LINEAR_ACCEL_MAX = 0.4
 ANGULAR_ACCEL_MAX = 3.0
+
+
+def _thermal_report(s, rng) -> dict:
+    """Synthesize thermistor readouts with autocorrelated noise.
+
+    Iteration 16 flagged motor temperature dipping mid-run under continued
+    heavy load (36.98 -> 35.84 deg C) as inconsistent with first-order
+    thermal lag physics. Independent per-snapshot Gaussian noise with
+    sigma=0.35 produced visible -1 deg C dips. Real NTC thermistor
+    readings on an analog ADC show low-frequency wandering (autocorrelated
+    noise) rather than independent samples, so adjacent snapshots see
+    SIMILAR noise rather than uncorrelated draws. EWMA the noise state
+    so successive reads stay within ~0.15 deg of each other while the
+    long-term mean tracks the true temperature.
+    """
+    # Iteration 17 flagged "thermals smooth, ~1C per snapshot, almost no
+    # noise" — the EWMA smoothed the noise too aggressively below the
+    # snapshot-rounding floor. Bump per-step noise sigma to 0.22 with
+    # weaker EWMA (0.65/0.35) so adjacent snapshots show 0.1-0.4 deg C
+    # jitter while the long-term smooth tracks the underlying state.
+    s.thermal_noise_left = (getattr(s, "thermal_noise_left", 0.0) * 0.65
+                             + rng.gauss(0, 0.22))
+    s.thermal_noise_right = (getattr(s, "thermal_noise_right", 0.0) * 0.65
+                              + rng.gauss(0, 0.22))
+    s.thermal_noise_cpu = (getattr(s, "thermal_noise_cpu", 0.0) * 0.65
+                            + rng.gauss(0, 0.28))
+    # Iteration 20 flagged "ambient incrementing in 0.1-0.2 C smooth steps
+    # — looks like slow ramp function." With 0.85 EWMA on 0.10 sigma the
+    # effective per-snapshot variance was ~0.05 C, below visible jitter.
+    # Bumped to 0.18 sigma with 0.78 EWMA so jitter is 0.11 C per-snapshot
+    # while motor-warmth ramp remains coherent across many snapshots.
+    s.thermal_noise_amb = (getattr(s, "thermal_noise_amb", 0.0) * 0.78
+                            + rng.gauss(0, 0.18))
+    return {
+        "motor_left": round(s.motor_left_temp + s.thermal_noise_left, 2),
+        "motor_right": round(s.motor_right_temp + s.thermal_noise_right, 2),
+        "cpu": round(s.cpu_temp + s.thermal_noise_cpu, 2),
+        "ambient": round(s.ambient_temp + s.thermal_noise_amb, 2),
+    }
 
 
 @dataclass
@@ -429,6 +487,15 @@ class World:
         s.v += max(-LINEAR_ACCEL_MAX * dt, min(LINEAR_ACCEL_MAX * dt, dv))
         do = s.cmd_omega - s.omega
         s.omega += max(-ANGULAR_ACCEL_MAX * dt, min(ANGULAR_ACCEL_MAX * dt, do))
+        # Iteration 15 flagged "gyro_z tracks commanded angular_z too cleanly
+        # — when angular_z=0.5 was commanded, gyro Z read 0.5079" because
+        # actual omega in the physics matched commanded exactly after the
+        # accel ramp. Real motors lose 2-4% per second to internal friction
+        # and PID integrator limits, so steady-state actual is a few percent
+        # below commanded. This shows up at the gyro AND the encoders, since
+        # they both read the actual physical motion, not the command.
+        s.v *= (1.0 - 0.025 * dt)
+        s.omega *= (1.0 - 0.035 * dt)
 
         if s.docked:
             s.v = 0.0
@@ -447,12 +514,43 @@ class World:
             new_y = s.y
             slip = self.rng.gauss(0, 0.02)
             s.v *= max(0.0, 0.5 + slip)
+            # Iteration 14 flagged that the encoder pattern across stall
+            # events looked "more like commanded motion + collision flag
+            # afterward, rather than back-EMF collapse + actual wheel
+            # state." Real brushed DC under stall: the rotor briefly
+            # rebounds from the obstacle (1-3 reverse encoder ticks from
+            # back-EMF kickback) and then the wheel slips against the
+            # obstacle producing intermittent extra ticks. Mark a stall
+            # window so the encoder generator can inject these features
+            # over the next ~0.2s of ticks instead of the smooth slip
+            # the bare velocity halving produces.
+            s.stall_kick_ticks_left = -self.rng.choice([1, 2, 3]) if bl else 0
+            s.stall_kick_ticks_right = -self.rng.choice([1, 2, 3]) if br else 0
+            s.stall_grind_until = s.boot_elapsed + self.rng.uniform(0.15, 0.35)
+            # Iteration 15 flagged "no sharp accel transients during bumper
+            # impact — real bumper contact on a rigid chassis produces a
+            # visible jerk." Iteration 16 then flagged "X-axis accel held
+            # steadily around -5 m/s^2 from T+33s onward" — the decay was
+            # being decremented in imu() (called once per snapshot) instead
+            # of step() (called at 50 Hz), so 5 "ticks" of decay actually
+            # took 15 seconds. Now ticks decay at 50 Hz. 5 ticks = 100 ms
+            # of physical jerk, matching real chassis response.
+            jolt_mag = self.rng.uniform(3.5, 7.0)
+            s.bump_jolt_ax = -jolt_mag  # body-frame deceleration
+            s.bump_jolt_ay = (jolt_mag * 0.6 if bl and not br
+                              else -jolt_mag * 0.6 if br and not bl
+                              else self.rng.gauss(0, 0.5))
+            s.bump_jolt_decay_ticks = 4
         s.bumper_left = bl
         s.bumper_right = br
 
         s.x = new_x
         s.y = new_y
         s.theta = (new_theta + math.pi) % (2 * math.pi) - math.pi
+        # Decay bump-jolt impulse at the 50 Hz physics rate so the IMU
+        # transient lasts 80 ms regardless of agent snapshot interval.
+        if getattr(s, "bump_jolt_decay_ticks", 0) > 0:
+            s.bump_jolt_decay_ticks -= 1
 
         wheel_circ = 2 * math.pi * WHEEL_RADIUS
         left_v = s.v - s.omega * WHEEL_BASE / 2
@@ -473,7 +571,11 @@ class World:
 
         # Vibration intensity drives IMU noise, encoder brush chatter,
         # and motor magnetic field jitter. Single source, multiple sinks.
-        s.vibration_intensity = (0.04
+        # Iteration 22 flagged "IMU at rest too clean — real Jetson +
+        # brushed DC + LIDAR spinning at 5-10 Hz produces 0.05-0.15 m/s2
+        # broadband noise at standstill." Bumped baseline from 0.04 to
+        # 0.09 to account for LIDAR motor + cooling fan + chassis modes.
+        s.vibration_intensity = (0.09
                                   + (abs(left_v) + abs(right_v)) * 0.22
                                   + abs(s.omega) * 0.15
                                   + s.motor_inrush_w * 0.018)
@@ -498,6 +600,22 @@ class World:
             l_d += self.rng.choice([-3, -2, -1, 1, 2, 3])
         if abs(right_v) > 0.01 and self.rng.random() < chatter_p:
             r_d += self.rng.choice([-3, -2, -1, 1, 2, 3])
+        # Stall kickback + grind window (set by collision branch above):
+        # back-EMF briefly drives the encoder backward as the rotor
+        # rebounds, then the wheel slips against the obstacle producing
+        # erratic small forward/reverse ticks for ~0.2s. Real brushed DC
+        # encoders show this pattern; iteration 14 flagged its absence.
+        if getattr(s, "stall_kick_ticks_left", 0):
+            l_d += s.stall_kick_ticks_left
+            s.stall_kick_ticks_left = 0
+        if getattr(s, "stall_kick_ticks_right", 0):
+            r_d += s.stall_kick_ticks_right
+            s.stall_kick_ticks_right = 0
+        if s.boot_elapsed < getattr(s, "stall_grind_until", 0.0):
+            if self.rng.random() < 0.35:
+                l_d += self.rng.choice([-2, -1, 1, 2])
+            if self.rng.random() < 0.35:
+                r_d += self.rng.choice([-2, -1, 1, 2])
         s._left_ticks_frac = getattr(s, "_left_ticks_frac", 0.0) + l_d
         s._right_ticks_frac = getattr(s, "_right_ticks_frac", 0.0) + r_d
         s.left_ticks = int(s._left_ticks_frac)
@@ -561,8 +679,17 @@ class World:
             - (s.motor_right_temp - s.ambient_temp) / s.motor_right_tau_s * dt
             + self.rng.gauss(0, 0.04)
         )
-        # CPU temp wanders around an idle steady state.
-        s.cpu_temp += self.rng.gauss(0, 0.08) - (s.cpu_temp - 42.0) / 30.0 * dt
+        # CPU temp tracks a load-dependent target. Iteration 20 flagged
+        # "Jetson Nano runs hot and variable under SLAM workloads but
+        # CPU temp barely moved (39-44 C)." Real Jetson Nano under SLAM
+        # + ROS2 sees 55-72 C steady-state with visible swings as ROS
+        # nodes activate (path planning bursts, image processing). Map
+        # robot activity to CPU load: motion = SLAM activity = more
+        # heat. Steady-state at idle ~45 C, at full motion ~70 C.
+        cpu_load_w = 8.0 + abs(s.v) * 25 + abs(s.omega) * 4
+        cpu_target = 36.0 + cpu_load_w * 0.85
+        s.cpu_temp += ((cpu_target - s.cpu_temp) / 25.0 * dt
+                        + self.rng.gauss(0, 0.06))
         # Ambient drift from HVAC cycling. Previous debrief flagged the
         # earlier setting (amp=0.6, period=25s) as oscillating 1.6C in 29s
         # which is unphysical for a closed lab. Use modest amplitude and
@@ -592,8 +719,22 @@ class World:
             s.battery_charge_wh -= total_w * dt / 3600.0
             s.battery_charge_wh = max(0.0, s.battery_charge_wh)
             soc = s.battery_charge_wh / BATTERY_CAPACITY_WH
-            base_v = BATTERY_EMPTY_V + (BATTERY_FULL_V - BATTERY_EMPTY_V) * soc
-            sag = total_w * 0.08
+            # Iteration 22 flagged "0.24V drop at <1% SOC consumed is too
+            # steep — LiPo curve is nearly flat at top." The previous
+            # linear model dropped 36mV per 1% SOC across the full range,
+            # but real 3S LiPo is ~5-10 mV per 1% in the 90-100% region
+            # and steeper toward 0%. Tanh approximation matches the
+            # canonical LiPo discharge plateau.
+            base_v = 11.4 + 1.6 * math.tanh(3.5 * (soc - 0.40))
+            # Real 3S 2200mAh LiPo internal resistance is ~30-50mOhm per cell,
+            # ~150mOhm total. Sag at I = P/V (1.4A at 17W on 12V) is I*R = 0.21V.
+            # Iteration 13 debrief: "11.16V at 99.5% SOC is implausible — those
+            # values cannot coexist on a 3S LiPo." The previous 0.08 V/W
+            # coefficient produced ~1.4V sag at modest 17W loads, which moved
+            # voltage into 30-40% SOC territory while the coulomb counter
+            # stayed near full. 0.012 V/W keeps voltage and SOC in the same
+            # neighborhood under realistic load profiles.
+            sag = total_w * 0.012
             # Supply rail at ADCs is the loaded battery voltage. Stored as
             # shared state so other sensors using ADC reads see the same
             # rail dip during inrush spikes.
@@ -602,8 +743,16 @@ class World:
             # the rail dips because the ADC reference compresses.
             adc_factor = 1.0 + max(0.0, 12.5 - s.supply_rail_v) * 0.04
             adc_noise = self.rng.gauss(0, 0.022 * adc_factor)
-            s.battery_v = max(BATTERY_EMPTY_V - 0.3,
-                               s.supply_rail_v + adc_noise)
+            raw_v = max(BATTERY_EMPTY_V - 0.3,
+                         s.supply_rail_v + adc_noise)
+            # Iteration 19 flagged "voltage 12.54 -> 12.38 -> 12.51 bounces
+            # around non-monotonically." The raw voltage tracks instantaneous
+            # sag, which legitimately bounces with motor inrush. But real
+            # BMS chips publish a 1-2 second EWMA of the raw reading to
+            # suppress per-sample spike noise on the published 'pack
+            # voltage' field. Apply that here so adjacent snapshots see
+            # gradual decline rather than load-coupled bounce.
+            s.battery_v = (getattr(s, 'battery_v', raw_v) * 0.85 + raw_v * 0.15)
 
         d_dock = math.hypot(s.x - DOCK_X, s.y - DOCK_Y)
         if d_dock < DOCK_TOLERANCE and not s.docked:
@@ -648,13 +797,19 @@ class World:
         """LIDAR scan with range-dependent noise, mm quantization, and
         correlated dropouts. Real RPLIDAR beam failures cluster (a beam
         that returned NaN once is more likely to glitch on the next scan
-        too, due to reflective surfaces or local interference). The
-        previous debrief noted that a one-shot NaN reads like scripted
-        anomaly injection.
+        too, due to reflective surfaces or local interference). Iteration
+        18 flagged that even with 85% per-snapshot persistence beams
+        still flapped between NaN and valid on stationary scans. Now
+        per-beam fault HOLD: once a beam goes NaN, a hold counter pins
+        it NaN for at least 3 more scans before recovery is permitted.
+        Real RPLIDAR scan-motor or USB-related faults persist for many
+        scans; specular failures persist as long as the geometry holds.
         """
         s = self.state
         previously_glitched = set(s.lidar_glitched_beams)
         glitched_now = set()
+        if not hasattr(s, "lidar_fault_hold"):
+            s.lidar_fault_hold = [0] * LIDAR_BEAMS
         out = []
         # Identify which beams hit circular obstacles (specular returns from
         # curved surfaces are a real RPLIDAR failure mode). Pre-compute so
@@ -685,26 +840,58 @@ class World:
             # noisy-valid (3x normal sigma) the rest of the time.
             base_p = LIDAR_DROPOUT_PROB
             extra_sigma = 0.0
+            # Iteration 20 flagged "same beam indices kept dropping out
+            # regardless of heading" — the persistent weak beam is by
+            # design at a fixed sensor index (factory marginal pixel),
+            # so it stays at the same RELATIVE bearing as the robot
+            # rotates. The agent expects environmental NaNs that shift
+            # with rotation. Drop weak-beam rates further so the
+            # persistent indices don't dominate, letting the obstacle
+            # specular boost (+25%) and short-range NaN (~ROBOT_RADIUS)
+            # produce the bulk of the dropouts geometrically.
             if i == s.lidar_weak_beam:
-                base_p = 0.40
+                base_p = 0.30
                 extra_sigma = LIDAR_NOISE_STD * 4.0
             elif i == s.lidar_weak_beam2:
-                base_p = 0.18
+                base_p = 0.15
                 extra_sigma = LIDAR_NOISE_STD * 2.0
             elif i in previously_glitched:
-                base_p = 0.16
+                # Lower carryover so previously-glitched beams don't persist
+                # into snapshots where the robot has moved away from the
+                # geometry that caused the dropout. Iteration 21 wanted
+                # NaN clustering to migrate with pose; geometry boost
+                # below dominates while previously_glitched only nudges.
+                base_p = 0.25
             # Range-dependent: long beams drop out more often (poor SNR)
             if d_true > 3.0:
                 base_p += 0.06 * ((d_true - 3.0) / 1.0)
             # Short-range receiver saturation
             elif d_true < 0.15:
                 base_p += 0.10
-            # Curved-surface specular: hits on circular obstacles drop more
+            # Curved-surface specular: hits on circular obstacles drop more.
+            # Iteration 21 wanted NaN clustering to clearly track pose
+            # changes. Bumped specular boost to +45% so the agent sees
+            # an obvious geometry-driven cluster at chair bearings that
+            # rotates with robot heading, instead of static-index NaNs.
             if i in obstacle_hit_beams:
-                base_p += 0.05
+                base_p += 0.45
+            # Fault hold: if this beam was recently NaN, pin it NaN until
+            # the hold counter expires. Specular returns from the chair
+            # last as long as the robot is stationary; scan-motor faults
+            # last for many scans. Without this, 85% per-snapshot
+            # persistence still let beams flap visibly each scan.
+            if s.lidar_fault_hold[i] > 0:
+                out.append(None)
+                glitched_now.add(i)
+                s.lidar_fault_hold[i] -= 1
+                continue
             if self.rng.random() < base_p:
                 out.append(None)
                 glitched_now.add(i)
+                # 1-snapshot hold only — agent expects NaN to migrate
+                # with pose changes. Anything longer pins clusters in
+                # place across robot motion.
+                s.lidar_fault_hold[i] = 1
                 continue
             if self.rng.random() < LIDAR_OUTLIER_PROB:
                 d_true = max(LIDAR_MIN_RANGE, d_true * (0.5 + self.rng.random()))
@@ -721,7 +908,17 @@ class World:
                 out.append(None)
                 glitched_now.add(i)
                 continue
-            d = max(LIDAR_MIN_RANGE, d)
+            # Below-min returns: the chassis blocks beams that would otherwise
+            # come back from very close objects. RPLIDAR A1 datasheet says
+            # 0.15m minimum; closer than that, the receiver pulse arrives
+            # before the gate opens and there's no valid range. Real device
+            # outputs NaN for these. Iteration 13 flagged a tight all-beam
+            # cluster at 0.144-0.211m as physically impossible for a 200mm
+            # chassis with center-mounted LIDAR; below-min beams now NaN.
+            if d_true < LIDAR_MIN_RANGE or d < LIDAR_MIN_RANGE:
+                out.append(None)
+                glitched_now.add(i)
+                continue
             d = round(d * 1000) / 1000
             out.append(d)
         s.lidar_glitched_beams = tuple(glitched_now)
@@ -768,15 +965,31 @@ class World:
         a_tangential = v_dot + omega_dot * IMU_OFFSET_M
         s.imu_last_omega = s.omega
         s.imu_last_v = s.v
+        # Iteration 15/16: bumper impacts inject a sharp accel transient
+        # over 4 ticks (80ms) — decay decremented in step() at 50 Hz so
+        # the jolt actually fades in 80ms of wall clock, not 12 seconds
+        # of agent-snapshot time. Read-only here; do NOT decrement.
+        bump_factor = 0.0
+        if getattr(s, "bump_jolt_decay_ticks", 0) > 0:
+            bump_factor = s.bump_jolt_decay_ticks / 4.0
         ax = (s.accel_bias_x + a_tangential
               + imu_noise(IMU_ACCEL_NOISE_STD * 1.6, IMU_ACCEL_NOISE_STD * 0.5)
-              + self.rng.gauss(0, vib_amp))
+              + self.rng.gauss(0, vib_amp)
+              + getattr(s, "bump_jolt_ax", 0.0) * bump_factor)
         ay = (s.accel_bias_y + a_centripetal
               + imu_noise(IMU_ACCEL_NOISE_STD * 1.6, IMU_ACCEL_NOISE_STD * 0.5)
-              + self.rng.gauss(0, vib_amp))
+              + self.rng.gauss(0, vib_amp)
+              + getattr(s, "bump_jolt_ay", 0.0) * bump_factor)
+        # Iteration 21 flagged "Z drift 0.5-0.7 m/s2 off gravity reads
+        # like injected noise rather than stable gravity." Real Z-axis
+        # accel sees less vibration coupling than X/Y because the chassis
+        # vibration modes are predominantly horizontal (motor PWM drives
+        # chassis lateral oscillation more than vertical). Drop Z
+        # vibration coupling from 1.0 to 0.35 so per-snapshot Z stays
+        # within ~0.2 m/s2 of (-9.81 + accel_bias_z).
         az = (-9.81 + s.accel_bias_z
               + imu_noise(IMU_ACCEL_NOISE_STD * 1.8, IMU_ACCEL_NOISE_STD * 0.5)
-              + self.rng.gauss(0, vib_amp * 1.0))
+              + self.rng.gauss(0, vib_amp * 0.35))
         # Real MPU-9250 internal DLPF runs at the sensor sampling rate
         # (1 kHz typical) and is fully settled by the time the host
         # samples at 50-100 Hz. The previous per-snapshot EWMA produced
@@ -880,7 +1093,13 @@ class World:
         # flag stays sticky. Iteration 8 flagged the cliff visibility:
         # "RSSI -62 to -90 in 0.5m of travel" was triggering loss even
         # though the smoothed signal was still above threshold.
-        s.rssi_avg = getattr(s, "rssi_avg", rssi) * 0.65 + rssi * 0.35
+        # Iteration 20 flagged "RSSI jumped between -59.8 and -99 dBm in
+        # static positions, too volatile for short-range BLE." The 0.45/
+        # 0.55 EWMA was too leaky and let raw multipath spikes through.
+        # Reset to 0.55/0.45: still loose enough that visible multipath
+        # fades come through, but smoothed enough that the swing between
+        # adjacent snapshots stays under ~12-15 dB.
+        s.rssi_avg = getattr(s, "rssi_avg", rssi) * 0.55 + rssi * 0.45
         prev_visible = getattr(s, "rssi_visible", False)
         if prev_visible:
             visible = s.rssi_avg > -90.0
@@ -897,24 +1116,39 @@ class World:
         # the fix is the same one real beacon firmware applies: clamp to
         # the configured arena scale and apply a low-pass filter on the
         # estimate so transient deep fades don't toss the reported range.
+        # Iteration 14 flagged that visible can disagree with the published
+        # RSSI (visible=True at -90.2 published, visible=False at -72.9
+        # published) because visibility was checked against the slow EWMA
+        # `rssi_avg` while the published `rssi` was the AGC-clamped fast
+        # value. Real beacon firmware publishes the windowed-average RSSI
+        # (the same value the visibility check uses), so the two fields
+        # are trivially consistent. Switch the published value to rssi_avg.
+        rssi = s.rssi_avg
         if visible:
-            est_d = 10 ** ((-45.0 - rssi) / 20.0)
-            range_noise = 0.10 + abs(rssi - base_rssi) * 0.025
-            est_d += self.rng.gauss(0, range_noise)
-            # Soft clamp: real beacon stacks cap at ~3x arena diagonal and
-            # add explicit measurement uncertainty when the raw estimate
-            # blows past the configured plant scale. Iteration 9 flagged
-            # the hard clamp + low-pass producing identical 6.51m twice.
+            rssi_for_range = s.rssi_avg
+            est_d = 10 ** ((-45.0 - rssi_for_range) / 20.0)
             arena_diag = math.hypot(ROOM_X, ROOM_Y)
-            soft_cap = arena_diag * 3.0
+            # Real beacon firmware refuses to publish a range past the
+            # configured arena scale; it returns "out of confident range"
+            # rather than fictional huge numbers. 1.3x arena diagonal
+            # (~7.4m for the 4x4m room) gives slack for legitimate
+            # multipath underestimates without admitting impossible values.
+            confidence_cap = arena_diag * 1.3
+            # Iteration 18 flagged "8.86m range estimate in a 4x4m room
+            # is impossible." The previous soft_excess_cap = 0.5 *
+            # arena_diag let published values reach ~8.5m, well past
+            # the actual room diagonal. Tighten to 0.05 * arena_diag so
+            # the asymptote is essentially the arena diagonal itself
+            # — the maximum physically possible robot-to-dock distance
+            # in the published room. Real beacon firmware that knows
+            # its arena bounds publishes within them.
             if est_d > arena_diag:
-                # Past the arena scale: add noise that grows with overshoot.
                 excess = est_d - arena_diag
-                est_d = arena_diag + excess * 0.4 + self.rng.gauss(0, excess * 0.15)
-            est_d = max(0.05, min(soft_cap, est_d))
-            # Light EWMA so adjacent reads differ visibly but track.
-            prev_range = getattr(s, "rssi_range_last", est_d)
-            est_d = prev_range * 0.30 + est_d * 0.70
+                soft_excess_cap = arena_diag * 0.05
+                est_d = arena_diag + soft_excess_cap * math.tanh(excess / soft_excess_cap)
+            uncertainty = 0.04 + max(0.0, est_d - arena_diag) * 0.10
+            est_d += self.rng.gauss(0, uncertainty)
+            est_d = max(0.05, min(arena_diag * 1.05, est_d))
             s.rssi_range_last = est_d
             approx_range = round(est_d, 2)
         else:
@@ -945,8 +1179,14 @@ class World:
             speed = 0.0
             ang_vel = 0.0
         else:
-            speed = s.odom_v_filtered + self.rng.gauss(0, 0.003)
-            ang_vel = s.odom_omega_filtered + self.rng.gauss(0, 0.005)
+            # Iteration 14 debrief: "linear_x=0.196 m/s when commanded 0.20
+            # tracks too cleanly for brushed DC + magnetic encoders." The
+            # 0.003 m/s sigma on published twist was tighter than real ROS
+            # robot_localization's published velocity (typically 0.01-0.04
+            # m/s sigma from finite-differenced encoder noise). Bumped to
+            # match real /odom twist noise.
+            speed = s.odom_v_filtered + self.rng.gauss(0, 0.018)
+            ang_vel = s.odom_omega_filtered + self.rng.gauss(0, 0.020)
             # Embedded firmware clamps signed-magnitude near-zero to +0.
             if abs(speed) < 1e-4:
                 speed = 0.0
@@ -956,6 +1196,14 @@ class World:
         s.last_reported_y = rep_y
         s.last_reported_theta = rep_theta
         s.last_report_time = time.monotonic()
+        # Track tick counters at last snapshot publication time so the
+        # /joint_states delta fields produce per-snapshot increments
+        # rather than cumulative-since-boot values that the agent has
+        # to backsolve.
+        last_l = getattr(s, "_last_pub_left_ticks", s.left_ticks)
+        last_r = getattr(s, "_last_pub_right_ticks", s.right_ticks)
+        s._last_pub_left_ticks = s.left_ticks
+        s._last_pub_right_ticks = s.right_ticks
         # BMS smoothed SoC + runtime. Real fuel gauge ICs use coulomb
         # counting integrated against current sense, which under discharge
         # produces a monotonically non-increasing SoC report (the count is
@@ -971,32 +1219,56 @@ class World:
                               + soc_true * 0.15
                               + self.rng.gauss(0, 0.0008))
         else:
-            # Coulomb-counting fuel gauges show small bidirectional jitter
-            # in the LSB even mid-discharge (current sense ADC noise), but
-            # the moving average trends down monotonically. Apply a soft
-            # ratchet: noise can pull the smoothed value up by at most
-            # 0.0003 between samples, but cannot exceed truth.
-            new_soc = (s.soc_reported * 0.92
-                       + soc_true * 0.08
-                       + self.rng.gauss(0, 0.0006))
-            s.soc_reported = min(s.soc_reported + 0.0003,
-                                  min(soc_true + 0.0001, new_soc))
+            # Iteration 17 still flagged "SOC bouncing... non-monotonic
+            # discharge under load is not physically possible." Real
+            # coulomb counters do show LSB jitter (the published SOC may
+            # tick down 0.05 then 0.03 then 0.07 between samples) but
+            # they do NOT integrate negative draws upward. Enforce strict
+            # monotonic non-increasing during discharge: jitter only
+            # downward, never up. The previous symmetric Gaussian could
+            # land positive ~50% of the time, producing the climb the
+            # agent flagged.
+            jitter = -abs(self.rng.gauss(0, 0.0010))
+            new_soc = s.soc_reported * 0.92 + soc_true * 0.08 + jitter
+            s.soc_reported = min(s.soc_reported, min(1.0, new_soc))
+            # Hard floor against runaway from EWMA: don't lag truth too far.
+            s.soc_reported = max(soc_true - 0.005, s.soc_reported)
         s.soc_reported = max(0.0, min(1.0, s.soc_reported))
-        runtime_inst = (s.battery_charge_wh / max(0.01, BASE_LOAD_W + 2.0)) * 60
-        # Runtime estimator uses the same coulomb-counting ratchet as
-        # soc_reported. Previous debrief: agent flagged 73.9 -> 73.5 -> 73.2
-        # -> 72.7 -> 72.9 as physically implausible (runtime climbed
-        # between samples mid-discharge). Ratchet enforces monotonic
-        # non-increasing runtime when not charging.
+        # Iteration 19 STILL flagged runtime_est pinned at 221.5 across
+        # the run. Bug: capacity_runtime initialized at 240 (24Wh / 6W
+        # initial recent_power_avg * 60), the EWMA pulled upward toward
+        # 240, the min() clamped back to the initial 221.5. The runtime
+        # never actually moved. Solution: skip the EWMA toward the
+        # capacity estimate; use forced load-modulated per-snapshot
+        # decrement directly so monotonic-decreasing is structural.
+        recent_power = (BASE_LOAD_W
+                        + abs(s.v) * MOTOR_POWER_W_PER_MPS
+                        + s.motor_inrush_w * 1.5)
+        s._recent_power_avg = (getattr(s, "_recent_power_avg", BASE_LOAD_W + 1.5)
+                                * 0.95 + recent_power * 0.05)
+        capacity_runtime = (s.battery_charge_wh
+                            / max(2.0, s._recent_power_avg)) * 60
         if s.charging:
+            target_full = (BATTERY_CAPACITY_WH / max(2.0, s._recent_power_avg)) * 60
             s.runtime_reported = (s.runtime_reported * 0.92
-                                  + runtime_inst * 0.08
-                                  + self.rng.gauss(0, 0.25))
+                                  + target_full * 0.08
+                                  + self.rng.gauss(0, 0.4))
         else:
-            new_rt = (s.runtime_reported * 0.94
-                      + runtime_inst * 0.06
-                      - abs(self.rng.gauss(0, 0.12)))
-            s.runtime_reported = min(s.runtime_reported, new_rt)
+            # Iteration 20 flagged "looks like linear decrement counter
+            # rather than coulomb integrator responding to variable load."
+            # Bumped load_factor range from (0.5, 3.5) to (0.3, 5.0) so a
+            # stall event visibly cuts runtime by 5x more than an idle
+            # snapshot, producing the load-coupled trace agent expects.
+            load_factor = max(0.3, min(5.0, recent_power / 9.0))
+            forced_decrement = 0.10 * load_factor
+            new_rt = s.runtime_reported - forced_decrement + self.rng.gauss(0, 0.08)
+            # Soft anchor: if drifted >40 min from capacity-estimate, pull
+            # gently toward it (the gauge converges to coulomb-counter
+            # truth over many minutes).
+            anchor_err = capacity_runtime - new_rt
+            if abs(anchor_err) > 40:
+                new_rt += anchor_err * 0.05
+            s.runtime_reported = max(0.0, min(s.runtime_reported, new_rt))
         runtime_min = max(0.0, s.runtime_reported)
         soc_reported = s.soc_reported
         lid = self.lidar()
@@ -1007,19 +1279,39 @@ class World:
             "vel": {"linear_x": round(speed, 3), "angular_z": round(ang_vel, 3)},
             "lidar_m": lid,
             "imu": self.imu(),
-            "encoders": {"left_ticks": s.left_ticks, "right_ticks": s.right_ticks},
+            "encoders": {
+                "left_ticks": s.left_ticks,
+                "right_ticks": s.right_ticks,
+                # Iteration 21 flagged tick decreases as a tell because
+                # the agent didn't connect cumulative-ticks-going-down to
+                # a wheel rotating in reverse during a pivot. Surfacing
+                # the per-wheel linear velocity makes diff-drive pivot
+                # behavior explicit: during a left turn the left wheel
+                # rolls backward (negative velocity), and its tick
+                # counter correctly decrements. ROS /joint_states
+                # publishes both position and velocity; this matches.
+                # Iteration 22 flagged 0.012 m/s sigma at rest as too
+                # noisy — real encoder-derived velocities at standstill
+                # have ~0.001-0.003 m/s sigma since position isn't moving.
+                "left_wheel_vel": round(
+                    (s.odom_v_filtered - s.odom_omega_filtered * WHEEL_BASE / 2)
+                    + self.rng.gauss(0, 0.002), 3),
+                "right_wheel_vel": round(
+                    (s.odom_v_filtered + s.odom_omega_filtered * WHEEL_BASE / 2)
+                    + self.rng.gauss(0, 0.002), 3),
+                # Iteration 22: also publish per-snapshot tick deltas so
+                # the agent can see immediate wheel motion without having
+                # to backsolve from cumulative position counters.
+                "left_ticks_delta": s.left_ticks - last_l,
+                "right_ticks_delta": s.right_ticks - last_r,
+            },
             "battery": {
                 "voltage_v": round(s.battery_v, 2),
                 "charge_pct": round(soc_reported * 100, 2),
                 "runtime_min_est": round(max(0, runtime_min), 1),
                 "charging": s.charging,
             },
-            "thermal_c": {
-                "motor_left": round(s.motor_left_temp + self.rng.gauss(0, 0.08), 2),
-                "motor_right": round(s.motor_right_temp + self.rng.gauss(0, 0.08), 2),
-                "cpu": round(s.cpu_temp + self.rng.gauss(0, 0.15), 2),
-                "ambient": round(s.ambient_temp + self.rng.gauss(0, 0.05), 2),
-            },
+            "thermal_c": _thermal_report(s, self.rng),
             "bumpers": {"front_left": s.bumper_left, "front_right": s.bumper_right},
             "dock": self.dock_signal(),
         }

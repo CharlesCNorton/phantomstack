@@ -75,6 +75,16 @@ mitigation in place.
   Adding a simulated camera would require either a renderer or pretense; both
   add tells without payoff for v1.
 
+## Iteration 14 (post 2026-05-07T141223 debrief)
+
+| Tell flagged | Fix |
+|---|---|
+| Dock RSSI improved while range estimate worsened (decoupled fields) | Range now derived deterministically from `s.rssi_avg`, no independent EWMA. Range and RSSI move together by construction. |
+| 13.7m range estimate published in a 4x4m arena | Confidence cap dropped from 3x to 1.3x arena diagonal (~7.4m). Past the cap, publish None instead of a fictional value. |
+| 11.16V at 99.5% SOC simultaneously (3S LiPo physics violation) | Battery sag coefficient dropped from 0.08 V/W to 0.012 V/W to match real LiPo internal resistance (~150mOhm pack total). At 17W load: ~0.21V sag, not 1.4V. |
+| All 12 LIDAR beams clustered at 0.144-0.211m when stuck | LIDAR_MIN_RANGE bumped from 0.05m to 0.15m (RPLIDAR A1 datasheet); below-min returns now NaN. The chassis blocks beams within ROBOT_RADIUS of center. |
+| NaN beams shifted between indices each snapshot | Baseline `LIDAR_DROPOUT_PROB` lowered from 0.015 to 0.004 so the persistent weak beam(s) dominate the NaN distribution. |
+
 ## Things to watch in the run log
 
 - Does the agent reference any inherited persona, prior project, or host

@@ -20,16 +20,28 @@ from .parser import parse_response
 
 
 def _outcome(prev: dict, new: dict, cmd: dict) -> str:
-    """Concise summary of what happened during this plan interval."""
-    if any(new["bumpers"].values()):
-        return "bumper triggered, no displacement on impact axis"
-    if new["dock"]["docked"]:
-        return "docked at charger"
+    """Concise summary of what happened during this plan interval.
+
+    Iteration 18 flagged the bumper-triggered branch as misleading
+    because it returned "no displacement on impact axis" even when
+    the robot translated significantly off-axis (rotation away from
+    obstacle). Now reports actual displacement magnitude alongside
+    the bumper state so the agent's pose / outcome / tick triple
+    cross-checks resolve consistently.
+    """
     dx = new["pose"]["x"] - prev["pose"]["x"]
     dy = new["pose"]["y"] - prev["pose"]["y"]
-    if abs(dx) > 0.01 or abs(dy) > 0.01:
+    disp = (dx * dx + dy * dy) ** 0.5
+    if any(new["bumpers"].values()):
+        side = ("L+R" if new["bumpers"]["front_left"]
+                            and new["bumpers"]["front_right"]
+                else "L" if new["bumpers"]["front_left"] else "R")
+        return f"bumper {side} active; disp={disp:.2f}m"
+    if new["dock"]["docked"]:
+        return "docked at charger"
+    if disp > 0.01:
         return (f"moved to ({new['pose']['x']:.2f},{new['pose']['y']:.2f}) "
-                f"theta={new['pose']['theta_rad']:.2f}rad")
+                f"theta={new['pose']['theta_rad']:.2f}rad disp={disp:.2f}m")
     return "no displacement"
 
 
