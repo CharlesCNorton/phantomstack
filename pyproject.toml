@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "phantomstack"
+version = "0.1.0"
+description = "Real-time agent harness for sandboxed embedded simulations. The agent thinks it is firmware on real hardware."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "phantomstack contributors" }]
+keywords = ["llm", "agent", "simulation", "robotics", "hardware-in-the-loop", "claude"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = []
+
+# Add [project.urls] (Homepage, Repository, Issues) once the repo is pushed.
+
+[project.scripts]
+phantomstack = "phantomstack.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["phantomstack*", "examples*"]
+exclude = ["_runtime*"]

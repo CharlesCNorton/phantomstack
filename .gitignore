@@ -1,0 +1,21 @@
+# phantomstack runtime artifacts (per-run logs, isolated home, clean cwd)
+_runtime/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+.eggs/
+.tox/
+.coverage
+htmlcov/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
